@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+. ./pannu-functions
+
+export PANNU_CONFIG_PATH="${HOME}/.config/pannu"
+mkdir -p "${PANNU_CONFIG_PATH}"
+
+args=${@:3}
+
+handled=yes
+case $2 in
+  test)
+    address=$($0 $1 get-address $args)
+
+    if >/dev/null ssh-keygen -R $address; then
+      _echoerr "known ssh keys cleared"
+    else
+      _echoerr "no known ssh keys cleared"
+    fi
+
+    while true; do
+      >/dev/null 2>&1 $0 $1 ssh $args uptime && break
+      _echoerr "retry"
+      sleep 1
+    done
+
+    _echoerr "OK"
+  ;;
+  install:*)
+    component=${2#*:}
+    env=":"
+    if test ! -t 0; then
+      env=$(cat)
+      echo $env
+    fi
+
+    $0 $1 scp $args \
+      scripts/install-$component.sh /tmp/pannu-install-$component.sh
+
+    $0 $1 ssh $args \
+      chmod +x /tmp/pannu-install-$component.sh
+
+    $0 $1 ssh $args \
+      "set -a && $env && set +a && /tmp/pannu-install-$component.sh"
+  ;;
+  *)
+    handled=no
+  ;;
+esac
+[ "$handled" = "yes" ] && exit
+
+args=${@:2}
+case $1 in
+  aws)
+    exec ./pannu-aws ${args}
+  ;;
+esac
+

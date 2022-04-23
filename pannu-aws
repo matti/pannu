@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+. ./pannu-functions
+
+export AWS_PAGER=""
+
+subcommand=${1}
+handled=yes
+case "${subcommand}" in
+  get-regions)
+    2>/dev/null aws ec2 describe-regions --region us-east-1 --output=text --query='Regions[*].RegionName'
+  ;;
+  list-all)
+    for region in $($0 get-regions); do
+      _echoerr "${region}:"
+      $0 list $region
+    done
+  ;;
+  *)
+    handled=no
+  ;;
+esac
+[ "$handled" = "yes" ] && exit 0
+
+region=${2}
+opts=${@:3}
+
+handled=yes
+case "${subcommand}" in
+  list)
+    instances=$(
+      aws ec2 describe-instances \
+        --region $region \
+        --filters "Name=tag:Name,Values=pannu-*" \
+        --query "Reservations[*].Instances[0].KeyName" \
+        --output "text"
+    )
+
+    for instance in $instances; do
+      echo ${instance#*-}
+    done
+  ;;
+  *)
+    handled=no
+  ;;
+esac
+[ "$handled" = "yes" ] && exit 0
+
+instance=${3}
+opts=${@:4}
+
+export PANNU_AWS_PATH="${PANNU_CONFIG_PATH}/aws/${region}/${instance}"
+mkdir -p ${PANNU_AWS_PATH}
+
+case "${subcommand}" in
+  get-address)
+    address=$(
+      aws ec2 describe-addresses \
+        --region $region \
+        --filters "Name=tag:Name,Values=pannu-$instance" \
+        --query 'Addresses[0].PublicIp' \
+        --output text
+    )
+
+    if [ "$address" = "None" ]; then
+      exit 1
+    else
+      echo $address
+    fi
+  ;;
+  ensure-address)
+    if ! $0 get-address $region $instance; then
+      1>/dev/null aws ec2 allocate-address \
+        --region $region \
+        --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Name,Value=pannu-$instance}]"
+      $0 get-address $region $instance
+    fi
+  ;;
+  delete-address)
+    allocationId=$($0 get-allocation-id $region $instance)
+    aws ec2 release-address \
+      --region $region \
+      --allocation-id $($0 get-allocation-id $region $instance)
+  ;;
+
+  get-allocation-id)
+    allocationId=$(
+      aws ec2 describe-addresses \
+        --region $region \
+        --filters "Name=tag:Name,Values=pannu-$instance" \
+        --query 'Addresses[0].AllocationId' \
+        --output text
+    )
+    if [ "$allocationId" = "None" ]; then
+      exit 1
+    else
+      echo "$allocationId"
+    fi
+  ;;
+
+  get-security-group)
+    securityGroups=$(
+      aws ec2 describe-security-groups \
+        --region $region \
+        --filters "Name=tag:Name,Values=pannu-$instance" \
+        --query "SecurityGroups[0].GroupId" \
+        --output text
+    )
+
+    if [ "$securityGroups" = "None" ]; then
+      exit 1
+    else
+      echo "$securityGroups"
+    fi
+  ;;
+  ensure-security-group)
+    if ! $0 get-security-group $region $instance; then
+      >/dev/null aws ec2 create-security-group \
+        --region $region \
+        --description pannu-$instance \
+        --group-name pannu-$instance \
+        --tag-specifications "ResourceType=security-group,Tags=[{Key=Name,Value=pannu-$instance}]"
+
+      $0 get-security-group $region $instance
+    fi
+  ;;
+  delete-security-group)
+    $0 get-security-group $region $instance || exit 1
+
+    while true; do
+      aws ec2 delete-security-group --region $region --group-name pannu-$instance && break
+      sleep 1
+    done
+  ;;
+  describe-security-group)
+    securityGroupId=$($0 get-security-group $region $instance)
+
+    aws ec2 describe-security-groups \
+      --region $region \
+      --group-ids $securityGroupId \
+      --query "SecurityGroups[0]" \
+      --output yaml
+  ;;
+
+  get-ingress|ensure-ingress|delete-ingress)
+    securityGroupId=$($0 get-security-group $region $instance)
+
+    for opt in $opts; do
+      case $opt in
+        --protocol=*)
+          protocol=${opt#*=}
+        ;;
+        --from=*)
+          from=${opt#*=}
+        ;;
+        --to=*)
+          to=${opt#*=}
+        ;;
+        --cidr=*)
+          cidr=${opt#*=}
+        ;;
+        --description=*)
+          description=${opt#*=}
+        ;;
+      esac
+    done
+
+    case $subcommand in
+      get-ingress)
+        securityGroupRuleId=$(
+          aws ec2 describe-security-group-rules \
+            --region $region \
+            --filters "Name=group-id,Values=$securityGroupId" \
+            --query "SecurityGroupRules[?!IsEgress && IpProtocol==\`$protocol\` && FromPort==\`$from\` && ToPort==\`$to\` && CidrIpv4==\`$cidr\`].SecurityGroupRuleId" \
+            --output "text"
+        )
+        if [ "$securityGroupRuleId" != "" ]; then
+          echo $securityGroupRuleId
+          exit 0
+        else
+          exit 1
+        fi
+      ;;
+      ensure-ingress)
+        $0 get-ingress $region $instance --protocol=$protocol --from=$from --to=$to --cidr=$cidr && exit 0
+
+        aws ec2 authorize-security-group-ingress \
+          --region $region \
+          --group-id $securityGroupId \
+          --query "SecurityGroupRules[0].SecurityGroupRuleId" \
+          --output "text" \
+          --ip-permissions """[
+{
+  \"IpProtocol\": \"${protocol}\",
+  \"FromPort\": ${from},
+  \"ToPort\": ${to},
+  \"IpRanges\": [
+    {
+      \"CidrIp\": \"${cidr}\",
+      \"Description\": \"${description:-}\"
+    }
+  ]
+}
+]"""
+      ;;
+      delete-ingress)
+        securityGroupRuleId=$($0 get-ingress $region $instance --protocol=$protocol --from=$from --to=$to --cidr=$cidr)
+        >/dev/null aws ec2 revoke-security-group-ingress \
+          --region $region \
+          --group-id $securityGroupId \
+          --security-group-rule-ids $securityGroupRuleId
+      ;;
+    esac
+  ;;
+
+  get-key-pair)
+    2>/dev/null aws ec2 describe-key-pairs \
+      --region $region \
+      --key-name pannu-$instance \
+      --query "KeyPairs[0].KeyPairId" \
+      --output text
+  ;;
+  ensure-key-pair)
+    if ! $0 get-key-pair $region $instance; then
+      aws ec2 create-key-pair \
+        --region $region \
+        --key-name pannu-$instance \
+        --query 'KeyMaterial' --output text > "${PANNU_AWS_PATH}/key"
+
+      $0 get-key-pair $region $instance
+    fi
+    chmod go= "${PANNU_AWS_PATH}/key"
+  ;;
+  delete-key-pair)
+    $0 get-key-pair $region $instance || exit 1
+
+    aws ec2 delete-key-pair \
+      --region $region \
+      --key-name pannu-$instance
+  ;;
+  get-instance-profile-name)
+    2>/dev/null aws iam get-instance-profile \
+      --region $region \
+      --instance-profile-name pannu-$instance \
+      --query "InstanceProfile.InstanceProfileName" \
+      --output text
+  ;;
+  ensure-instance-profile)
+    if ! $0 get-instance-profile-name $region $instance; then
+      >/dev/null aws iam create-instance-profile  \
+        --region $region \
+        --instance-profile-name pannu-$instance
+
+      $0 get-instance-profile-name $region $instance
+    fi
+
+    >/dev/null $0 add-role-to-instance-profile $region $instance
+  ;;
+  delete-instance-profile)
+    $0 get-instance-profile-name $region $instance || exit 1
+
+    $0 remove-role-from-instance-profile $region $instance
+
+    aws iam delete-instance-profile  \
+      --region $region \
+      --instance-profile-name pannu-$instance
+  ;;
+  get-instance-profile-roles)
+    roles=$(
+      2>/dev/null aws iam get-instance-profile \
+        --region $region \
+        --instance-profile-name pannu-$instance \
+        --query "InstanceProfile.Roles[*].RoleName" \
+        --output text
+    )
+
+    if [ "$roles" = "" ]; then
+      exit 1
+    else
+      echo $roles
+      exit 0
+    fi
+  ;;
+  add-role-to-instance-profile)
+    if ! $0 get-instance-profile-roles $region $instance; then
+      aws iam add-role-to-instance-profile \
+        --region $region \
+        --instance-profile-name pannu-$instance \
+        --role-name AmazonSSMRoleForInstancesQuickSetup
+    fi
+  ;;
+  remove-role-from-instance-profile)
+    $0 get-instance-profile-roles $region $instance || exit 1
+
+    aws iam remove-role-from-instance-profile \
+      --region $region \
+      --instance-profile-name pannu-$instance \
+      --role-name AmazonSSMRoleForInstancesQuickSetup
+  ;;
+  ensure)
+    instanceType=""
+
+    if >/dev/null $0 get-instances-by-state $region $instance stopping; then
+      >/dev/null $0 wait-instance-state $region $instance stopped
+    fi
+
+    if >/dev/null $0 get-instances-by-state $region $instance stopped; then
+      $0 start $region $instance
+      >/dev/null $0 wait-instance-state $region $instance running
+    fi
+
+    if >/dev/null $0 get-instances-by-state $region $instance pending; then
+      >/dev/null $0 wait-instance-state $region $instance running
+    fi
+
+    if ! >/dev/null $0 get-instances-by-state $region $instance running; then
+      securityGroupId=$($0 ensure-security-group $region $instance)
+      keyPairId=$($0 ensure-key-pair $region $instance)
+      instanceProfileName=$($0 ensure-instance-profile $region $instance)
+
+      for opt in $opts; do
+        case $opt in
+          --image-id=*)
+            imageId=${opt#*=}
+          ;;
+          --instance-type=*)
+            instanceType=${opt#*=}
+          ;;
+          --volume-size=*)
+            volumeSize=${opt#*=}
+          ;;
+          --volume-type=*)
+            volumeType=${opt#*=}
+          ;;
+          --volume-throughput=*)
+            volumeThroughput=${opt#*=}
+          ;;
+          --volume-iops=*)
+            volumeIops=${opt#*=}
+          ;;
+        esac
+      done
+
+      if [ "${imageId:-}" = "" ]; then
+        imageId=$(
+          aws ec2 describe-images \
+            --region $region \
+            --owners 099720109477 \
+            --filters "Name=name,Values=*ubuntu-*-20.04-*" "Name=architecture,Values=x86_64" \
+            --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+            --output text
+        )
+      fi
+
+      if [ "$instanceType" = "" ]; then
+        instanceSelectorInstances=$(
+          ec2-instance-selector \
+                  --region=$region \
+                  --vcpus-max=2 \
+                  --memory-max=2 \
+                  --cpu-architecture x86_64 \
+                  --gpus 0 \
+                  --root-device-type ebs
+        )
+
+        instanceType=$(echo $instanceSelectorInstances | cut -d' ' -f1)
+      fi
+
+      echo """#!/usr/bin/env bash
+set -euo pipefail
+
+date > /tmp/pannu.start
+echo 'changing root password'
+echo 'root:badpassword' | sudo chpasswd
+echo 'password changed'
+date > /tmp/pannu.done
+""" > /tmp/pannu.$region.$instance.userdata.sh
+
+      aws ec2 run-instances \
+        --region $region \
+        --count 1 \
+        --image-id $imageId \
+        --instance-type $instanceType \
+        --block-device-mappings "DeviceName=/dev/sda1,Ebs={DeleteOnTermination=true,VolumeType=${volumeType:-gp3},VolumeSize=${volumeSize:-20},Throughput=${volumeThroughput:-125},Iops=${volumeIops:-3000}}" \
+        --key-name pannu-$instance \
+        --security-group-ids $securityGroupId \
+        --iam-instance-profile "Name=${instanceProfileName}" \
+        --user-data "file:///tmp/pannu.${region}.${instance}.userdata.sh" \
+        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=pannu-$instance}]"
+    fi
+
+    instanceId=$($0 wait-instance-state $region $instance running)
+    if >/dev/null $0 ensure-ingress $region $instance --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0; then
+      _echoerr "port 22 opened"
+    else
+      _echoerr "port 22 already opened"
+    fi
+
+    address=$($0 ensure-address $region $instance)
+    allocationId=$($0 get-allocation-id $region $instance)
+
+    >/dev/null aws ec2 associate-address \
+      --region $region \
+      --allow-reassociation \
+      --instance-id $instanceId \
+      --allocation-id $allocationId
+
+    ./pannu aws test $region $instance
+
+    echo $instanceId
+  ;;
+  delete-instance)
+    instanceIds=$($0 get-instance-ids $region $instance)
+    [ "$instanceIds" = "" ] && exit 1
+
+    >/dev/null aws ec2 terminate-instances --region $region --instance-ids $instanceIds
+  ;;
+  wait-instance-state)
+    state=${4}
+    while true; do
+      $0 get-instances-by-state $region $instance $state && break
+      _echoerr "instance not '$state' ..."
+      sleep 1
+    done
+
+    _echoerr "reached status '$state'"
+  ;;
+  get-instance-ids)
+    aws ec2 describe-instances \
+      --region $region \
+      --filters "Name=tag:Name,Values=pannu-$instance" \
+      --query 'Reservations[*].Instances[*].InstanceId' \
+      --output text
+  ;;
+  get-all-instances-by-state)
+    state=$3
+    $0 get-instances-by-state $region "*" $state
+  ;;
+  get-instances-by-state)
+    state=$4
+    instanceIds=$(
+      aws ec2 describe-instances \
+        --region $region \
+        --filters "Name=tag:Name,Values=pannu-${instance}" \
+        --query "Reservations[*].Instances[?contains(State.Name, '$state')].InstanceId" \
+        --output text
+    )
+
+    if [ "$instanceIds" = "" ]; then
+      exit 1
+    else
+      for instanceId in $instanceIds; do
+        echo $instanceId
+      done
+    fi
+  ;;
+
+  stop)
+    if instanceIds=$($0 get-instances-by-state $region $instance running); then
+      aws ec2 stop-instances \
+        --region $region \
+        --instance-ids $instanceIds
+
+      $0 wait-instance-state $region $instance stopped
+    else
+      _err "no running instances found"
+    fi
+  ;;
+  start)
+    if instanceIds=$($0 get-instances-by-state $region $instance stopped); then
+      _echoerr "starting $instanceIds"
+      >/dev/null aws ec2 start-instances \
+        --region $region \
+        --instance-ids $instanceIds
+
+      $0 wait-instance-state $region $instance running
+      echo $instanceIds
+    else
+      _err "no stopped instances found"
+    fi
+  ;;
+  delete)
+    if $0 delete-instance $region $instance; then
+      _echoerr "deleted all pannu-$instance instances, including terminated ones"
+    else
+      _echoerr "no instances found for deletion"
+    fi
+
+    if $0 delete-instance-profile $region $instance; then
+      _echoerr "deleted instance profile"
+    else
+      _echoerr "instance profile already deleted"
+    fi
+
+    if $0 delete-key-pair $region $instance; then
+      _echoerr "key pair deleted"
+    else
+      _echoerr "key pair already deleted"
+    fi
+
+    if $0 delete-security-group $region $instance; then
+      _echoerr "security group deleted"
+    else
+      _echoerr "security group already deleted"
+    fi
+
+    if $0 delete-address $region $instance; then
+      _echoerr "address deleted"
+    else
+      _echoerr "address already deleted"
+    fi
+
+    _echoerr ""
+    _echoerr "delete OK"
+  ;;
+  scp-upload|scp-download)
+    address=$($0 get-address $region $instance)
+
+    case "$subcommand" in
+      scp-upload)
+        from=$4
+        to=ubuntu@$address:$5
+      ;;
+      scp-download)
+        from=ubuntu@$address:$4
+        to=$5
+    esac
+
+    exec scp \
+      -oStrictHostKeyChecking=no \
+      -i "${PANNU_AWS_PATH}/key" \
+      $from $to
+  ;;
+  port-forward)
+    forward=$4
+    address=$($0 get-address $region $instance)
+    exec ssh \
+      -nNT \
+      -oStrictHostKeyChecking=no \
+      -oConnectTimeout=3 \
+      -i "${PANNU_AWS_PATH}/key" \
+      -L $forward \
+      ubuntu@$address
+  ;;
+  ssh)
+    address=$($0 get-address $region $instance)
+    exec ssh \
+      -t \
+      -oStrictHostKeyChecking=no \
+      -oConnectTimeout=3 \
+      -i "${PANNU_AWS_PATH}/key" \
+      ubuntu@$address \
+      ${@:4}
+  ;;
+  *)
+    _err "unknown subcommand: '$subcommand'"
+  ;;
+esac

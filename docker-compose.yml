@@ -1,0 +1,12 @@
+version: '3'
+
+services:
+  pannu:
+    build: .
+    image: pannu
+    volumes:
+      - ./.state/.bash_history:/root/.bash_history
+      - ./.state/.config:/root/.config
+      - ./.state/.ssh:/root/.ssh
+    env_file:
+      - .env

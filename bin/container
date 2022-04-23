@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p .state
+mkdir -p .state/.ssh
+mkdir -p .state/.config
+
+touch .state/.bash_history
+
+case $1 in
+  recreate)
+    exec docker-compose up --build --force-recreate pannu
+  ;;
+  shell)
+    exec docker-compose exec pannu bash
+  ;;
+esac

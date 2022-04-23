@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -x
+
+_fail() {
+  echo "FAIL: $@"
+  exit 1
+}
+
+_fail_if_empty() {
+  if [ "${2}" = "" ]; then
+    _fail "${1} empty"
+  fi
+}
+
+_fail_if_not_same() {
+  if [ "$2" != "$3" ]; then
+    _fail "$1 is not same ('$2' != '$3')"
+  fi
+}
+
+./pannu aws delete eu-north-1 test || :
+
+# -- address
+./pannu aws get-address eu-north-1 test && _fail "address exists"
+
+address=$(./pannu aws ensure-address eu-north-1 test)
+addressAgain=$(./pannu aws ensure-address eu-north-1 test)
+
+_fail_if_empty "address" address
+_fail_if_empty "addressAgain" addressAgain
+
+_fail_if_not_same "address" $address $addressAgain
+
+allocationId=$(./pannu aws get-allocation-id eu-north-1 test)
+allocationIdAgain=$(./pannu aws get-allocation-id eu-north-1 test)
+
+_fail_if_empty "allocationId" $allocationId
+_fail_if_not_same "allocationId" $allocationId $allocationIdAgain
+
+# -- security group
+
+./pannu aws get-security-group eu-north-1 test && _fail "security group exist"
+
+securityGroup=$(./pannu aws ensure-security-group eu-north-1 test)
+securityGroupAgain=$(./pannu aws ensure-security-group eu-north-1 test)
+
+_fail_if_empty "securityGroup" $securityGroup
+_fail_if_not_same "securityGroup" $securityGroup $securityGroupAgain
+
+
+securityGroupRuleId=$(./pannu aws ensure-ingress eu-north-1 test --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0)
+securityGroupRuleIdAgain=$(./pannu aws ensure-ingress eu-north-1 test --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0)
+
+_fail_if_empty "securityGroupRuleId" $securityGroupRuleId
+_fail_if_not_same "securityGroupRuleId" $securityGroupRuleId $securityGroupRuleIdAgain
+
+securityGroupRuleIdGet=$(./pannu aws get-ingress eu-north-1 test --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0)
+_fail_if_not_same "securityGroupRuleId" $securityGroupRuleId $securityGroupRuleIdGet
+
+# get-key-pair
+
+./pannu aws get-key-pair eu-north-1 test && _fail "key-pair exists"
+
+keyPairId=$(./pannu aws ensure-key-pair eu-north-1 test)
+keyPairIdAgain=$(./pannu aws ensure-key-pair eu-north-1 test)
+
+_fail_if_empty "keyPairId" $keyPairId
+_fail_if_not_same "keyPairId" $keyPairId $keyPairIdAgain
+
+
+# -- deletion
+
+./pannu aws delete-key-pair eu-north-1 test || _fail "key-pair delete failed"
+./pannu aws delete-key-pair eu-north-1 test && _fail "key-pair delete gave ok"
+
+./pannu aws delete-ingress eu-north-1 test --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0 || _fail "ingress delete failed"
+./pannu aws delete-ingress eu-north-1 test --protocol=tcp --from=22 --to=22 --cidr=0.0.0.0/0 && _fail "ingress delete gave ok"
+
+./pannu aws delete-security-group eu-north-1 test || _fail "security group delete failed"
+./pannu aws delete-security-group eu-north-1 test && _fail "security group delete gave ok"
+
+./pannu aws delete-address eu-north-1 test || _fail "address delete failed"
+./pannu aws delete-address eu-north-1 test && _fail "address delete gave ok"
+
+
+./pannu aws get-allocation-id eu-north-1 test && _fail "get-allocation-id gave ok"
+
+instanceId=$(./pannu aws ensure eu-north-1 test)
+instanceIdAgain=$(./pannu aws ensure eu-north-1 test)
+
+_fail_if_empty "instanceId" $instanceId
+_fail_if_not_same "instanceId" $instanceId $instanceIdAgain
+
+# -- stop start
+./pannu aws stop eu-north-1 test
+./pannu aws wait-instance-state eu-north-1 test stopped
+
+./pannu aws start eu-north-1 test
+./pannu aws wait-instance-state eu-north-1 test running
+
+./pannu aws ssh eu-north-1 test uptime && break
+
+./pannu aws delete eu-north-1 test
+
+exit 0
